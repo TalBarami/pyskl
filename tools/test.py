@@ -11,14 +11,14 @@ from mmcv import Config
 from mmcv import digit_version as dv
 from mmcv import load
 from mmcv.cnn import fuse_conv_bn
-from mmcv.engine import multi_gpu_test
+from mmcv.engine import single_gpu_test
 from mmcv.fileio.io import file_handlers
-from mmcv.parallel import MMDistributedDataParallel
-from mmcv.runner import get_dist_info, init_dist, load_checkpoint
+# from mmcv.parallel import MMDistributedDataParallel
+from mmcv.runner import load_checkpoint
 
 from pyskl.datasets import build_dataloader, build_dataset
 from pyskl.models import build_model
-from pyskl.utils import cache_checkpoint, mc_off, mc_on, test_port
+from pyskl.utils import cache_checkpoint
 
 
 def parse_args():
@@ -98,11 +98,13 @@ def inference_pytorch(args, cfg, data_loader):
     if args.fuse_conv_bn:
         model = fuse_conv_bn(model)
 
-    model = MMDistributedDataParallel(
-        model.cuda(),
-        device_ids=[torch.cuda.current_device()],
-        broadcast_buffers=False)
-    outputs = multi_gpu_test(model, data_loader, args.tmpdir)
+    # model = MMDistributedDataParallel(
+    #     model.cuda(),
+    #     device_ids=[torch.cuda.current_device()],
+    #     broadcast_buffers=False)
+    model = model.cuda()
+    outputs = single_gpu_test(model, data_loader)
+    # outputs = multi_gpu_test(model, data_loader, args.tmpdir)
 
     return outputs
 
@@ -134,9 +136,10 @@ def main():
     if not hasattr(cfg, 'dist_params'):
         cfg.dist_params = dict(backend='nccl')
 
-    init_dist(args.launcher, **cfg.dist_params)
-    rank, world_size = get_dist_info()
-    cfg.gpu_ids = range(world_size)
+    # init_dist(args.launcher, **cfg.dist_params)
+    # rank, world_size = get_dist_info()
+    # cfg.gpu_ids = range(world_size)
+    cfg.gpu_ids = 0
 
     # build the dataloader
     dataset = build_dataset(cfg.data.test, dict(test_mode=True))
@@ -147,37 +150,38 @@ def main():
     dataloader_setting = dict(dataloader_setting, **cfg.data.get('test_dataloader', {}))
     data_loader = build_dataloader(dataset, **dataloader_setting)
 
-    default_mc_cfg = ('localhost', 22077)
-    memcached = cfg.get('memcached', False)
+    # default_mc_cfg = ('localhost', 22077)
+    # memcached = cfg.get('memcached', False)
 
-    if rank == 0 and memcached:
-        # mc_list is a list of pickle files you want to cache in memory.
-        # Basically, each pickle file is a dictionary.
-        mc_cfg = cfg.get('mc_cfg', default_mc_cfg)
-        assert isinstance(mc_cfg, tuple) and mc_cfg[0] == 'localhost'
-        if not test_port(mc_cfg[0], mc_cfg[1]):
-            mc_on(port=mc_cfg[1], launcher=args.launcher)
-        retry = 3
-        while not test_port(mc_cfg[0], mc_cfg[1]) and retry > 0:
-            time.sleep(5)
-            retry -= 1
-        assert retry >= 0, 'Failed to launch memcached. '
+    # if rank == 0 and memcached:
+    #     # mc_list is a list of pickle files you want to cache in memory.
+    #     # Basically, each pickle file is a dictionary.
+    #     mc_cfg = cfg.get('mc_cfg', default_mc_cfg)
+    #     assert isinstance(mc_cfg, tuple) and mc_cfg[0] == 'localhost'
+    #     if not test_port(mc_cfg[0], mc_cfg[1]):
+    #         mc_on(port=mc_cfg[1], launcher=args.launcher)
+    #     retry = 3
+    #     while not test_port(mc_cfg[0], mc_cfg[1]) and retry > 0:
+    #         time.sleep(5)
+    #         retry -= 1
+    #     assert retry >= 0, 'Failed to launch memcached. '
 
-    dist.barrier()
+    # dist.barrier()
     outputs = inference_pytorch(args, cfg, data_loader)
 
-    rank, _ = get_dist_info()
+    # rank, _ = get_dist_info()
+    rank = 0
     if rank == 0:
         print(f'\nwriting results to {out}')
         dataset.dump_results(outputs, out=out)
-        if eval_cfg:
-            eval_res = dataset.evaluate(outputs, **eval_cfg)
-            for name, val in eval_res.items():
-                print(f'{name}: {val:.04f}')
+        # if eval_cfg:
+        #     eval_res = dataset.evaluate(outputs, **eval_cfg)
+        #     for name, val in eval_res.items():
+        #         print(f'{name}: {val:.04f}')
 
-    dist.barrier()
-    if rank == 0 and memcached:
-        mc_off()
+    # dist.barrier()
+    # if rank == 0 and memcached:
+    #     mc_off()
 
 
 if __name__ == '__main__':

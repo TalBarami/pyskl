@@ -150,6 +150,9 @@ class BaseRecognizer(nn.Module, metaclass=ABCMeta):
 
     def forward(self, imgs, label=None, return_loss=True, **kwargs):
         """Define the computation performed at every call."""
+        device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device
+        imgs = imgs.to(device)
+        label = label.to(device)
         if return_loss:
             if label is None:
                 raise ValueError('Label should not be None.')

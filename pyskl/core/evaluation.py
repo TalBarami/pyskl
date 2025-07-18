@@ -1,9 +1,9 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import numpy as np
-from mmcv.runner import DistEvalHook as BasicDistEvalHook
+from mmcv.runner import EvalHook as BasicEvalHook
 
 
-class DistEvalHook(BasicDistEvalHook):
+class DistEvalHook(BasicEvalHook):
     greater_keys = [
         'acc', 'top', 'AR@', 'auc', 'precision', 'mAP@', 'Recall@'
     ]

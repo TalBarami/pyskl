@@ -550,3 +550,21 @@ class DecompressPose:
 
     def __repr__(self):
         return (f'{self.__class__.__name__}(squeeze={self.squeeze}, max_person={self.max_person})')
+
+@PIPELINES.register_module()
+class ChildDetect:
+    def __call__(self, results):
+        cids = results['child_id'].astype(int)
+        kp = results['keypoint']
+        kps = results['keypoint_score']
+        if kp.shape[0] == 0:
+            results['keypoint'] = np.zeros((1, kp.shape[1], kp.shape[2], kp.shape[3]), dtype=kp.dtype)
+            results['keypoint_score'] = np.zeros((1, kp.shape[1], kp.shape[2]), dtype=kps.dtype)
+        else:
+            F = np.arange(len(cids))
+            results['keypoint'] = kp[cids, F][np.newaxis, ...]
+            results['keypoint_score'] = kps[cids, F][np.newaxis, ...]
+        return results
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}'

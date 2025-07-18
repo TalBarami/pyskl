@@ -59,6 +59,9 @@ class PoseCompact:
     def __call__(self, results):
         img_shape = results['img_shape']
         h, w = img_shape
+        if h == 0 or w == 0:
+            img_shape = results['original_shape']
+            h, w = img_shape
         kp = results['keypoint']
 
         # Make NaN zero
@@ -102,8 +105,11 @@ class PoseCompact:
 
         # the order is x, y, w, h (in [0, 1]), a tuple
         crop_quadruple = results.get('crop_quadruple', (0., 0., 1., 1.))
-        new_crop_quadruple = (min_x / w, min_y / h, (max_x - min_x) / w,
-                              (max_y - min_y) / h)
+        try:
+            new_crop_quadruple = (min_x / w, min_y / h, (max_x - min_x) / w,
+                                  (max_y - min_y) / h)
+        except Exception as e:
+            print(min_x, min_y, max_x, max_y, w, h)
         crop_quadruple = _combine_quadruple(crop_quadruple, new_crop_quadruple)
         results['crop_quadruple'] = crop_quadruple
         return results
@@ -898,4 +904,37 @@ class TenCrop:
 
     def __repr__(self):
         repr_str = f'{self.__class__.__name__}(crop_size={self.crop_size})'
+        return repr_str
+
+
+@PIPELINES.register_module()
+class Splitter:
+    def __init__(self, window_size):
+        """Initialize the Splitter.
+
+        Args:
+            window_size (int): The size of the window to split the data.
+        """
+        if not isinstance(window_size, int) or window_size <= 0:
+            raise ValueError(f'Window size must be a positive integer, '
+                             f'but got {window_size}')
+        self.window_size = window_size
+
+    def __call__(self, results):
+        T = results['keypoint'].shape[1]
+        if T <= 0:
+            raise ValueError('The number of frames T must be greater than 0.')
+        if T <= self.window_size:
+            return results
+        s = random.randint(0, T - self.window_size)
+        t = s + self.window_size
+        results['keypoint'] = results['keypoint'][:, s:t]
+        results['keypoint_score'] = results['keypoint_score'][:, s:t]
+        results['total_frames'] = self.window_size
+        if 'child_ids' in results:
+            results['child_ids'] = results['child_ids'][s:t]
+        return results
+
+    def __repr__(self):
+        repr_str = f'{self.__class__.__name__}(window_size={self.window_size})'
         return repr_str

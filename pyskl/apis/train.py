@@ -4,7 +4,7 @@ import os
 import os.path as osp
 import time
 import torch
-import torch.distributed as dist
+# import torch.distributed as dist
 from mmcv.engine import multi_gpu_test
 from mmcv.parallel import MMDistributedDataParallel
 from mmcv.runner import DistSamplerSeedHook, EpochBasedRunner, OptimizerHook, build_optimizer, get_dist_info
@@ -43,7 +43,7 @@ def init_random_seed(seed=None, device='cuda'):
     else:
         random_num = torch.tensor(0, dtype=torch.int32, device=device)
 
-    dist.broadcast(random_num, src=0)
+    # dist.broadcast(random_num, src=0)
     return random_num.item()
 
 
@@ -90,11 +90,12 @@ def train_model(model,
     find_unused_parameters = cfg.get('find_unused_parameters', True)
     # Sets the `find_unused_parameters` parameter in
     # torch.nn.parallel.DistributedDataParallel
-    model = MMDistributedDataParallel(
-        model.cuda(),
-        device_ids=[torch.cuda.current_device()],
-        broadcast_buffers=False,
-        find_unused_parameters=find_unused_parameters)
+    # model = MMDistributedDataParallel(
+    #     model.cuda(),
+    #     device_ids=[torch.cuda.current_device()],
+    #     broadcast_buffers=False,
+    #     find_unused_parameters=find_unused_parameters)
+    model = model.cuda()
 
     # build runner
     optimizer = build_optimizer(model, cfg.optimizer)
@@ -143,7 +144,7 @@ def train_model(model,
 
     runner.run(data_loaders, cfg.workflow, cfg.total_epochs)
 
-    dist.barrier()
+    # dist.barrier()
     time.sleep(2)
 
     if test['test_last'] or test['test_best']:
