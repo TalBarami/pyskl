@@ -1,10 +1,12 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+
+import h5py
 import numpy as np
 from scipy.stats import mode as get_mode
 
-from ..builder import PIPELINES
 from .compose import Compose
 from .formatting import Rename
+from ..builder import PIPELINES
 
 EPS = 1e-4
 
@@ -551,20 +553,93 @@ class DecompressPose:
     def __repr__(self):
         return (f'{self.__class__.__name__}(squeeze={self.squeeze}, max_person={self.max_person})')
 
+
+class H5PoseLoader:
+    def __call__(self, results):
+        start, end, name, filepath = results['start'], results['end'], results['basename'], results['filepath']
+        with h5py.File(filepath, "r") as f:
+            kp = f['kp'][start:end].transpose(1, 0, 2, 3)
+            kps = f['kps'][start:end].transpose(1, 0, 2)
+            cids = f['cids'][start:end] if 'cids' in f else None
+        seq_len = end - start
+        results = {**results, **{
+            'keypoint': kp,
+            'keypoint_score': kps,
+            'child_id': cids,
+            'frame_dir': f'{name}_{start}_{end}',
+            'total_frames': seq_len,
+            'segment_name': f'{name}_{start}_{end}',
+        }}
+        return results
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}()'
+
 @PIPELINES.register_module()
 class ChildDetect:
     def __call__(self, results):
         cids = results['child_id'].astype(int)
         kp = results['keypoint']
         kps = results['keypoint_score']
-        if kp.shape[0] == 0:
-            results['keypoint'] = np.zeros((1, kp.shape[1], kp.shape[2], kp.shape[3]), dtype=kp.dtype)
-            results['keypoint_score'] = np.zeros((1, kp.shape[1], kp.shape[2]), dtype=kps.dtype)
-        else:
-            F = np.arange(len(cids))
-            results['keypoint'] = kp[cids, F][np.newaxis, ...]
-            results['keypoint_score'] = kps[cids, F][np.newaxis, ...]
+        # if kp.shape[0] == 0:
+        #     results['keypoint'] = np.zeros((1, kp.shape[1], kp.shape[2], kp.shape[3]), dtype=kp.dtype)
+        #     results['keypoint_score'] = np.zeros((1, kp.shape[1], kp.shape[2]), dtype=kps.dtype)
+        # else:
+        F = np.arange(len(cids))
+        results['keypoint'] = kp[cids, F][np.newaxis, ...]
+        results['keypoint_score'] = kps[cids, F][np.newaxis, ...]
+        results['kp_child'] = results['keypoint']
+        results['kps_child'] = results['keypoint_score']
         return results
 
     def __repr__(self):
-        return f'{self.__class__.__name__}'
+        return f'{self.__class__.__name__}()'
+
+@PIPELINES.register_module()
+class TemporalShuffle:
+    def __call__(self, results):
+        kp = results['keypoint']
+        kps = results['keypoint_score']
+        F = kp.shape[1]
+        perm = np.random.permutation(F)
+        results['keypoint'] = kp[:, perm].copy()
+        results['keypoint_score'] = kps[:, perm].copy()
+        return results
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}()'
+
+@PIPELINES.register_module()
+class JointDisturbance:
+    def __init__(self, n_keep, visible_threshold, visible_ratio):
+        self.n_keep = n_keep
+        self.visible_threshold = visible_threshold
+        self.visible_ratio = visible_ratio
+
+    def __call__(self, results):
+        kp = results['keypoint'][0]
+        kps = results['keypoint_score'][0]
+        F, J = kps.shape
+
+        # Compute per-joint visibility ratio
+        visible_counts = np.sum(kps > self.visible_threshold, axis=0)
+        visible_joints = np.where(visible_counts / F >= self.visible_ratio)[0]
+
+        if len(visible_joints) == 0:
+            return results
+        n_keep = min(self.n_keep, len(visible_joints))
+        keep_joints = np.random.choice(visible_joints, size=n_keep, replace=False)
+
+        mask = np.zeros_like(kps, dtype=bool)
+        mask[:, keep_joints] = True
+
+        kp = np.where(mask[..., None], kp, 0)
+        kps = np.where(mask, kps, 0)
+
+        results['keypoint'] = kp[None, ...]
+        results['keypoint_score'] = kps[None, ...]
+
+        return results
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}(n_keep={self.n_keep}, visible_threshold={self.visible_threshold}, visible_ratio={self.visible_ratio})'
