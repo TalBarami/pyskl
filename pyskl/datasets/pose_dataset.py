@@ -118,11 +118,13 @@ class ASDetDataset(PoseDataset):
     def __init__(self,
                  ann_file,
                  pipeline,
+                 atypes,
                  target_fps,
                  sequence_length_seconds,
                  step_size_seconds,
                  valid_threshold,
-                 random_sampling_state=42,
+                 njoints_threshold,
+                 random_sampling_state=None,
                  min_length_prop=0.75,
                  fold=None,
                  split='train',
@@ -136,16 +138,20 @@ class ASDetDataset(PoseDataset):
         if ann_file.endswith('.h5'):
             self.files = pd.Series({'filepath': ann_file, 'split': 'test', 'fold': np.nan}).to_frame().T
         else:
-            self.files = pd.read_csv(ann_file)
+            files = pd.read_csv(ann_file)
+            files = files[files['atype'].isin(atypes)].reset_index(drop=True)
+            self.files = files
         self.target_fps = target_fps
         self.sequence_length_seconds = sequence_length_seconds
         self.sequence_length = self.sequence_length_seconds * self.target_fps
         self.step_size = step_size_seconds * self.target_fps
         self.valid_threshold = valid_threshold
+        self.njoints_threshold = njoints_threshold
         self.min_length_prop = min_length_prop
         self.min_segment_length = self.min_length_prop * self.sequence_length_seconds
         self.random_sampling_state = random_sampling_state
         self.fold = fold
+        self.split = split
         self.balance = balance
         self.ds, self.metadata = self.load_dataset()
         super().__init__(ann_file, pipeline, split, valid_ratio, box_thr, class_prob, memcached, mc_cfg, **kwargs)
@@ -161,17 +167,43 @@ class ASDetDataset(PoseDataset):
         intervals = [(x, min(x + sequence_frames, video_length)) for x in starts]
         return intervals
 
+    def read_segments(self, file):
+        with h5py.File(file, "r") as f:
+            vi_attrs = dict(f["video_info"].attrs)
+            video_info = pd.Series({k: v.decode() if isinstance(v, bytes) else v for k, v in vi_attrs.items()})
+            video_info['filepath'] = file
+            vf = f['valid_frames'][()]
+            if 'valid_keypoints' in f:
+                vkp = f['valid_keypoints'][()].astype(int)
+            else:
+                vkp = np.ones(vf.shape).astype(int) * 17
+            F = vf.shape[0]
+            _F = f['kp'].shape[0]
+            intervals = self.generate_intervals(self.sequence_length, self.step_size, video_info['fps'], self.target_fps, F)
+            df = pd.DataFrame(intervals, columns=['start', 'end'])
+            df = df[df['end'] <= _F]
+            starts = df['start'].astype(int).to_numpy()
+            ends = df['end'].astype(int).to_numpy()
+            df['valid%'] = [np.mean(vf[s:e]) for s, e in zip(starts, ends)]
+            df['mean_valid_joints'] = [np.mean(vkp[s:e]) for s, e in zip(starts, ends)]
+            above_t_vkp = vkp >= self.njoints_threshold
+            df['above_t_valid_joints'] = [np.mean(above_t_vkp[s:e]) for s, e in zip(starts, ends)]
+            df['segment_length_seconds'] = (df['end'] - df['start']) / video_info['fps']
+            df['basename'] = video_info['basename']
+        return df, video_info
+
     def load_dataset(self):
         metadata = {}
         segments = []
-        for i, row in self.files.iterrows():
+        files = self.files[self.files['split'] == self.split]
+        if self.fold is not None:
+            files = files[files['fold'].isin(self.fold)]
+        for i, row in files.iterrows():
             f = row['filepath']
             if not osp.exists(f):
                 print(f"File {f} does not exist, skipping.")
                 continue
             seg, meta = self.read_segments(f)
-            if 'split' in meta.keys():
-                meta = meta.drop(columns=['split'])
             seg['split'] = row['split']
             seg['fold'] = row['fold']
             metadata[meta['basename']] = meta
@@ -179,35 +211,20 @@ class ASDetDataset(PoseDataset):
         _df = pd.concat(segments)
         _df['length'] = _df['end'] - _df['start']
         df = _df[(_df['valid%'] >= self.valid_threshold) &
+                 # (_df['valid_joints'] >= self.njoints_threshold) &
+                 (_df['above_t_valid_joints'] >= self.valid_threshold) &
                  (_df['segment_length_seconds'] >= self.min_segment_length)].reset_index(drop=True)
         df['assessment'] = df['basename'].apply(lambda x: metadata[x]['assessment'])
         df['cid'] = df['basename'].apply(lambda x: metadata[x]['cid'])
         df['final_diagnosis'] = df['basename'].apply(lambda x: metadata[x]['final_diagnosis'])
+        df['label'] = df['final_diagnosis'].map({'ASD': 1, 'Control': 0, 'ASD denied': 0})
         # print(f'Final dataset size: {len(segments)} segments from {segments["basename"].nunique()} videos.')
         # print(f'Label distribution:\n{segments["final_diagnosis"].value_counts()}\n({segments["final_diagnosis"].value_counts(normalize=True)})')
         return df, metadata
 
-    def read_segments(self, file):
-        with h5py.File(file, "r") as f:
-            vi_attrs = dict(f["video_info"].attrs)
-            video_info = pd.Series({k: v.decode() if isinstance(v, bytes) else v for k, v in vi_attrs.items()})
-            video_info['filepath'] = file
-            vf = f['valid_frames'][()]
-            F = vf.shape[0]
-            _F = f['kp'].shape[0]
-            intervals = self.generate_intervals(self.sequence_length, self.step_size, video_info['fps'], self.target_fps, F)
-            df = pd.DataFrame(intervals, columns=['start', 'end'])
-            df = df[df['end'] <= _F]
-            df['valid%'] = df.apply(lambda x: np.mean(vf[x['start']:x['end']]), axis=1)
-            df['segment_length_seconds'] = (df['end'] - df['start']) / video_info['fps']
-            df['basename'] = video_info['basename']
-        return df, video_info
-
     def load_annotations(self):
         """Load annotation file to get video information."""
-        df = self.ds[self.ds['split'] == self.split].reset_index(drop=True) if self.split is not None else self.ds
-        if self.fold is not None:
-            df = df[df['fold'].isin(self.fold)].reset_index(drop=True)
+        df = self.ds
         if self.balance in ['downsample', 'upsample']:
             counts = df['final_diagnosis'].value_counts()
             n = counts.min() if self.balance == 'downsample' else counts.max()
@@ -221,13 +238,14 @@ class ASDetDataset(PoseDataset):
             )
         elif self.balance is not None:
             raise ValueError(f'Unknown balance method: {self.balance}')
-        df['label'] = df['final_diagnosis'].map({'ASD': 1, 'Control': 0, 'ASD denied': 0})
         ds = [{
                 'start': row['start'],
                 'end': row['end'],
                 'basename': row['basename'],
                 'label': row['label'],
                 'valid%': row['valid%'],
+                'mean_valid_joints': row['mean_valid_joints'],
+                'above_t_valid_joints': row['above_t_valid_joints'],
                 'split': row['split'],
                 'filepath': self.metadata[row['basename']]['filepath'],
                 'img_shape': (int(self.metadata[row['basename']]['height']),
@@ -235,128 +253,3 @@ class ASDetDataset(PoseDataset):
                }
             for _, row in df.iterrows()]
         return ds
-
-# @DATASETS.register_module()
-# class SkeletonDataset(PoseDataset):
-#     def __init__(self,
-#                  ann_file,
-#                  pipeline,
-#                  label_col,
-#                  target_fps=25,
-#                  sequence_length_seconds=10,
-#                  step_size_seconds=10,
-#                  valid_threshold=0.75,
-#                  min_length_prop=0.75,
-#                  random_sampling_state=42,
-#                  fold=None,
-#                  split=None,
-#                  balance=None,
-#                  rndlbl=False,
-#                  valid_ratio=None,
-#                  box_thr=None,
-#                  class_prob=None,
-#                  memcached=False,
-#                  mc_cfg=('localhost', 22077),
-#                  **kwargs):
-#         if ann_file.endswith('.h5'):
-#             self.files = pd.Series({'filepath': ann_file, 'split': 'test', 'fold': np.nan}).to_frame().T
-#         else:
-#             self.files = pd.read_csv(ann_file)
-#         self.label_col = label_col
-#         self.target_fps = target_fps
-#         self.sequence_length_seconds = sequence_length_seconds
-#         self.sequence_length = self.sequence_length_seconds * self.target_fps
-#         self.step_size = step_size_seconds * self.target_fps
-#         self.valid_threshold = valid_threshold
-#         self.min_length_prop = min_length_prop
-#         self.random_sampling_state = random_sampling_state
-#         self.fold = fold
-#         self.balance = balance
-#         self.rndlbl = rndlbl
-#         self.ds, self.metadata = self.load_dataset()
-#         super().__init__(ann_file, pipeline, split, valid_ratio, box_thr, class_prob, memcached, mc_cfg, **kwargs)
-#
-#     def load_annotations(self):
-#         """Load annotation file to get video information."""
-#         df = self.ds[self.ds['split'] == self.split].reset_index(drop=True) if self.split else self.ds
-#         if self.fold is not None:
-#             df = df[df['fold'].isin(self.fold)].reset_index(drop=True)
-#         if self.balance is not None:
-#             counts = df['final_diagnosis'].value_counts()
-#             n = counts.min() if self.balance == 'downsample' else counts.max()
-#             def safe_sample(group):
-#                 rep = n > len(group)  # only oversample minority with replacement
-#                 return group.sample(n=n, random_state=self.random_sampling_state, replace=rep)
-#             df = (
-#                 df.groupby('final_diagnosis', group_keys=False)
-#                 .apply(safe_sample)
-#                 .reset_index(drop=True)
-#             )
-#             print(f'Sampled {n} samples per class, total {len(df)} samples.')
-#         if self.rndlbl:
-#             # random 0,1 label assignment, for sanity check
-#             df['final_diagnosis'] = df['final_diagnosis'].apply(lambda x: random.choice([0, 1]))
-#         else:
-#             df['final_diagnosis'] = df['final_diagnosis'].apply(lambda x: 1 if x == 'ASD' else 0)
-#         ds = [{
-#             'start': row['start'],
-#             'end': row['end'],
-#             'basename': row['basename'],
-#             # 'label': 1 if (self.metadata[row['basename']][self.label_col] == 'ASD') else 0,
-#             'label': row[self.label_col],
-#             'valid%': row['valid%'],
-#             'split': row['split']}
-#             for _, row in df.iterrows()]
-#         return ds
-#
-#     @staticmethod
-#     def generate_intervals(sequence_length, step_size, original_fps, target_fps, video_length):
-#         sequence_time = sequence_length / target_fps # in seconds
-#         step_time = step_size / target_fps # in seconds
-#         sequence_frames = int(np.round(sequence_time * original_fps))
-#         step_frames = int(np.round(step_time * original_fps))
-#         F = video_length - sequence_frames + step_frames
-#         starts = (np.arange(0, F / original_fps, step_time) * original_fps).round().astype(int)
-#         intervals = [(x, min(x + sequence_frames, video_length)) for x in starts]
-#         return intervals
-#
-#     def read_segments(self, file):
-#         with h5py.File(file, "r") as f:
-#             vi_attrs = dict(f["video_info"].attrs)
-#             video_info = pd.Series({k: v.decode() if isinstance(v, bytes) else v for k, v in vi_attrs.items()})
-#             vf = f['valid_frames'][()]
-#             F = vf.shape[0]
-#             _F = f['kp'].shape[0]
-#             intervals = self.generate_intervals(self.sequence_length, self.step_size, video_info['fps'], self.target_fps, F)
-#             df = pd.DataFrame(intervals, columns=['start', 'end'])
-#             df = df[df['end'] <= _F]
-#             df['valid%'] = df.apply(lambda x: np.mean(vf[x['start']:x['end']]), axis=1)
-#             df['segment_length_seconds'] = (df['end'] - df['start']) / video_info['fps']
-#             df['basename'] = video_info['basename']
-#         return df, video_info
-#
-#     def load_dataset(self):
-#         metadata = {}
-#         segments = []
-#         for i, row in self.files.iterrows():
-#             f = row['filepath']
-#             if not osp.exists(f):
-#                 print(f"File {f} does not exist, skipping.")
-#                 continue
-#             seg, meta = self.read_segments(f)
-#             if 'split' in meta.keys():
-#                 meta = meta.drop(columns=['split'])
-#             seg['split'] = row['split']
-#             seg['fold'] = row['fold']
-#             metadata[meta['basename']] = meta
-#             segments.append(seg)
-#         segments = pd.concat(segments)
-#         segments['length'] = segments['end'] - segments['start']
-#         segments = segments[(segments['valid%'] >= self.valid_threshold) &
-#                             (segments['segment_length_seconds'] >= self.min_length_prop * self.sequence_length_seconds)].reset_index(drop=True)
-#         segments['assessment'] = segments['basename'].apply(lambda x: metadata[x]['assessment'])
-#         segments['cid'] = segments['basename'].apply(lambda x: metadata[x]['cid'])
-#         segments['final_diagnosis'] = segments['basename'].apply(lambda x: metadata[x]['final_diagnosis'])
-#         # print(f'Final dataset size: {len(segments)} segments from {segments["basename"].nunique()} videos.')
-#         # print(f'Label distribution:\n{segments["final_diagnosis"].value_counts()}\n({segments["final_diagnosis"].value_counts(normalize=True)})')
-#         return segments, metadata

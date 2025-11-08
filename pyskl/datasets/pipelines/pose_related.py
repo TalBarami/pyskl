@@ -553,7 +553,7 @@ class DecompressPose:
     def __repr__(self):
         return (f'{self.__class__.__name__}(squeeze={self.squeeze}, max_person={self.max_person})')
 
-
+@PIPELINES.register_module()
 class H5PoseLoader:
     def __call__(self, results):
         start, end, name, filepath = results['start'], results['end'], results['basename'], results['filepath']
@@ -612,7 +612,7 @@ class TemporalShuffle:
 @PIPELINES.register_module()
 class JointDisturbance:
     def __init__(self, n_keep, visible_threshold, visible_ratio):
-        self.n_keep = n_keep
+        self.n_keep = int(n_keep)
         self.visible_threshold = visible_threshold
         self.visible_ratio = visible_ratio
 
@@ -643,3 +643,15 @@ class JointDisturbance:
 
     def __repr__(self):
         return f'{self.__class__.__name__}(n_keep={self.n_keep}, visible_threshold={self.visible_threshold}, visible_ratio={self.visible_ratio})'
+
+@PIPELINES.register_module()
+class PositionRandomize:
+    def __call__(self, results):
+        kp = results['keypoint']
+        H, W = results['img_shape']
+        random_kp = np.zeros_like(kp, dtype=kp.dtype)
+        random_kp[..., 0] = np.random.uniform(0, W, size=kp[..., 0].shape)  # x
+        random_kp[..., 1] = np.random.uniform(0, H, size=kp[..., 1].shape)  # y
+
+        results['keypoint'] = random_kp
+        return results
