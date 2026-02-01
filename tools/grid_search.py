@@ -1,6 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 # flake8: noqa: E722
 import argparse
+import shutil
+
 import mmcv
 import os
 import os.path as osp
@@ -23,7 +25,8 @@ from pyskl.utils import collect_env, get_root_logger, mc_off, mc_on, test_port
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a recognizer')
-    parser.add_argument('-n', '--n', help='train config file path', type=int)
+    parser.add_argument('-n', '--experiment', type=int, required=True, help='variant index to run')
+    parser.add_argument('-e', '--experiment_name', type=str, required=True, help='experiment name')
     parser.add_argument(
         '--validate',
         action='store_true',
@@ -61,12 +64,24 @@ def parse_args():
 
 def main():
     args = parse_args()
-    root = r'/groups/azencot_group/asdet/experiments/configurations'
-    # df = pd.read_csv(osp.join(root, 'variants_grid.csv'))
-    # s = df.iloc[args.n].to_dict()
-    print(f'Running variant {args.n}')
-    args.config = osp.join(root, f'{args.n}.py')
+    exp_id = args.experiment
+    exp_name = args.experiment_name
+    project_root = r'/groups/azencot_group/asdet/experiments'
+    configurations_dir = osp.join(project_root, exp_name, 'configurations')
+    df = pd.read_csv(osp.join(project_root, exp_name, 'training_experiments.csv'))
+    variant = df.iloc[exp_id]
+    if exp_id != variant['experiment_id']:
+        raise ValueError(f'Experiment index {args.experiment} does not match experiment_id {variant["experiment_id"]}!')
+    if osp.exists(osp.join(variant['experiment_path'], f'epoch_{variant["n_epochs"]}.pth')):
+        print(f'Experiment {variant["experiment_id"]} already trained, skipping.')
+        return
+    elif osp.exists(variant['experiment_path']):
+        print(f'Removing experiment {variant["experiment_id"]} from {variant["experiment_path"]}')
+        shutil.rmtree(variant['experiment_path'])
+    print(f'Running variant {variant["experiment_id"]}:\n{variant}')
+    args.config = osp.join(configurations_dir, f'{exp_id}.py')
     cfg = Config.fromfile(args.config)
+    args.seed = cfg.random_sampling_state
 
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):

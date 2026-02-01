@@ -273,6 +273,112 @@ class GeneratePoseTarget:
                     f'right_kp={self.right_kp})')
         return repr_str
 
+@PIPELINES.register_module
+class GeneratePoseTargetByRole(GeneratePoseTarget):
+    """
+    Produces role-aware heatmaps:
+      - child: J channels
+      - adults: J channels (aggregated via max over people, same as original)
+    Output:
+      results['imgs'] = heatmap of shape [T, 2J, H, W] (or doubled if self.double)
+    Requires:
+      results['kp_child'], results['kps_child']
+      results['kp_adults'], results['kps_adults']
+      results['img_shape']
+    """
+
+    def __init__(self, *args, include_adult_count=False, adult_count_mode='constant', **kwargs):
+        super().__init__(*args, **kwargs)
+        self.include_adult_count = include_adult_count
+        assert adult_count_mode in ('constant',), "extend if you want per-frame"
+        self.adult_count_mode = adult_count_mode
+
+    def _gen_from_kp(self, kp, kps, img_shape):
+        # This is basically your gen_an_aug but without mutating results in-place.
+        kp = kp.copy()
+        if kps is None:
+            kps = np.ones(kp.shape[:-1], dtype=np.float32)
+
+        img_h, img_w = img_shape
+
+        img_h = int(img_h * self.scaling + 0.5)
+        img_w = int(img_w * self.scaling + 0.5)
+        kp[..., :2] *= self.scaling
+
+        num_frame = kp.shape[1]
+        num_c = 0
+        if self.with_kp:
+            num_c += kp.shape[2]          # J
+        if self.with_limb:
+            num_c += len(self.skeletons)
+
+        ret = np.zeros([num_frame, num_c, img_h, img_w], dtype=np.float32)
+
+        for i in range(num_frame):
+            kps_i = kp[:, i]  # (M, J, 2) for kp or (M, V, 2)
+            scr_i = kps[:, i] if self.use_score else np.ones_like(kps[:, i])
+            self.generate_heatmap(ret[i], kps_i, scr_i)
+
+        return ret  # (T, C, H, W)
+
+    def __call__(self, results):
+        img_shape = results['img_shape']
+
+        kp_child = results['kp_child']     # (1, T, J, 2)
+        kps_child = results.get('kps_child', None)
+
+        kp_adults = results['kp_adults']   # (A, T, J, 2) with A=M-1
+        kps_adults = results.get('kps_adults', None)
+
+        hm_child = self._gen_from_kp(kp_child, kps_child, img_shape)   # (T, J, H, W)
+        hm_adult = self._gen_from_kp(kp_adults, kps_adults, img_shape) # (T, J, H, W)
+
+        heatmap = np.concatenate([hm_child, hm_adult], axis=1)         # (T, 2J, H, W)
+
+        if self.include_adult_count:
+            # Add one extra channel with the number of adults, broadcast over T,H,W
+            A = kp_adults.shape[0]
+            cnt = np.full((heatmap.shape[0], 1, heatmap.shape[2], heatmap.shape[3]),
+                          float(A), dtype=np.float32)
+            heatmap = np.concatenate([heatmap, cnt], axis=1)           # (T, 2J+1, H, W)
+
+        key = 'heatmap_imgs' if 'imgs' in results else 'imgs'
+
+        if self.double:
+            indices = np.arange(heatmap.shape[1], dtype=np.int64)
+
+            # IMPORTANT: you now have 2 (or 2+1) blocks. We must flip within each block.
+            base_c = hm_child.shape[1]  # J (or limb channels)
+            left, right = (self.left_kp, self.right_kp) if self.with_kp else (self.left_limb, self.right_limb)
+
+            def perm_for_block(offset):
+                idx = np.arange(base_c, dtype=np.int64) + offset
+                for l, r in zip(left, right):
+                    idx[l] = r + offset
+                    idx[r] = l + offset
+                return idx
+
+            # Build full indices: child block then adult block then optional count channel
+            idx_child = perm_for_block(0)
+            idx_adult = perm_for_block(base_c)
+            idx = np.concatenate([idx_child, idx_adult])
+
+            if self.include_adult_count:
+                idx = np.concatenate([idx, np.array([2 * base_c], dtype=np.int64)])  # count channel unchanged
+
+            heatmap_flip = heatmap[..., ::-1][:, idx]
+            heatmap = np.concatenate([heatmap, heatmap_flip], axis=0)  # doubles time dimension like original
+
+        results[key] = heatmap
+        return results
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}('
+                f'sigma={self.sigma}, use_score={self.use_score}, '
+                f'with_kp={self.with_kp}, with_limb={self.with_limb}, '
+                f'double={self.double}, include_adult_count={self.include_adult_count}, '
+                f'scaling={self.scaling})')
+
 
 # The Input will be a feature map ((N x T) x H x W x K), The output will be
 # a 2D map: (N x H x W x [K * (2C + 1)])

@@ -136,7 +136,7 @@ def train_model(model,
         eval_hook = DistEvalHook(val_dataloader, **eval_cfg)
         runner.register_hook(eval_hook)
 
-    if cfg.get('resume_from', None):
+    if cfg.get('resume_from', None) and osp.exists(cfg.resume_from):
         runner.resume(cfg.resume_from)
     elif cfg.get('load_from', None):
         cfg.load_from = cache_checkpoint(cfg.load_from)

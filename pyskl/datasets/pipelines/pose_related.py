@@ -44,6 +44,10 @@ class PoseDecode:
         if 'keypoint' in results:
             results['keypoint'] = self._load_kp(results['keypoint'], frame_inds)
 
+        if 'child_id' in results:
+            results['child_id'] = results['child_id'][frame_inds].astype(np.int32)
+
+
         return results
 
     def __repr__(self):
@@ -558,9 +562,9 @@ class H5PoseLoader:
     def __call__(self, results):
         start, end, name, filepath = results['start'], results['end'], results['basename'], results['filepath']
         with h5py.File(filepath, "r") as f:
-            kp = f['kp'][start:end].transpose(1, 0, 2, 3)
-            kps = f['kps'][start:end].transpose(1, 0, 2)
-            cids = f['cids'][start:end] if 'cids' in f else None
+            kp = f['kp'][start:end].transpose(1, 0, 2, 3).astype(np.float32)
+            kps = f['kps'][start:end].transpose(1, 0, 2).astype(np.float32)
+            cids = f['cids'][start:end].astype(np.float32) if 'cids' in f else None
         seq_len = end - start
         results = {**results, **{
             'keypoint': kp,
@@ -596,6 +600,85 @@ class ChildDetect:
         return f'{self.__class__.__name__}()'
 
 @PIPELINES.register_module()
+class SplitPoseByRole:
+    """
+    Build kp_child/kps_child and kp_adults/kps_adults from the *current*
+    results['keypoint'] / results['keypoint_score'] and results['child_id'].
+
+    Expects:
+      keypoint: (M, T, J, 2)
+      keypoint_score: (M, T, J)
+      child_id: (T,)
+    Produces:
+      kp_child: (1, T, J, 2)
+      kps_child: (1, T, J)
+      kp_adults: (M-1, T, J, 2)
+      kps_adults: (M-1, T, J)
+    """
+
+    def __call__(self, results):
+        kp = results['keypoint']
+        kps = results.get('keypoint_score', None)
+        cids = results['child_id'].astype(np.int64)
+
+        M, T, J, C = kp.shape
+
+        F = np.arange(T)
+
+        # child
+        kp_child = kp[cids, F][np.newaxis, ...]
+        if kps is None:
+            kps_child = np.ones((1, T, J), dtype=np.float32)
+        else:
+            kps_child = kps[cids, F][np.newaxis, ...]
+
+        # adults (all except chosen child per frame)
+        adult_mask = np.ones((M, T), dtype=bool)
+        adult_mask[cids, F] = False
+
+        kp_adults = np.zeros((M - 1, T, J, 2), dtype=kp.dtype)
+        if kps is None:
+            kps_adults = np.ones((M - 1, T, J), dtype=np.float32)
+        else:
+            kps_adults = np.zeros((M - 1, T, J), dtype=kps.dtype)
+
+        for t in range(T):
+            idx = np.flatnonzero(adult_mask[:, t])  # length M-1
+            kp_adults[:, t] = kp[idx, t]
+            if kps is not None:
+                kps_adults[:, t] = kps[idx, t]
+
+        results['kp_child'] = kp_child
+        results['kps_child'] = kps_child
+        results['kp_adults'] = kp_adults
+        results['kps_adults'] = kps_adults
+        return results
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}()'
+
+
+@PIPELINES.register_module()
+class RandomSubsample:
+    def __init__(self, sample_length_seconds):
+        self.sample_length_seconds = sample_length_seconds
+
+    def __call__(self, results):
+        fps = results['fps']
+        sample_length = int(self.sample_length_seconds * fps)
+        total_frames = results['total_frames']
+        if total_frames <= sample_length:
+            return results
+        start_frame = np.random.randint(0, total_frames - sample_length + 1)
+        end_frame = start_frame + sample_length
+        results['keypoint'] = results['keypoint'][:, start_frame:end_frame].copy()
+        results['keypoint_score'] = results['keypoint_score'][:, start_frame:end_frame].copy()
+        results['child_id'] = results['child_id'][start_frame:end_frame].copy()
+        results['total_frames'] = sample_length
+        return results
+
+
+@PIPELINES.register_module()
 class TemporalShuffle:
     def __call__(self, results):
         kp = results['keypoint']
@@ -608,6 +691,17 @@ class TemporalShuffle:
 
     def __repr__(self):
         return f'{self.__class__.__name__}()'
+
+@PIPELINES.register_module()
+class FrameFreeze:
+    def __call__(self, results):
+        kp = results['keypoint']
+        kps = results['keypoint_score']
+        F = kp.shape[1]
+        freeze_frame = np.random.randint(F)
+        results['keypoint'] = np.repeat(kp[:, freeze_frame:freeze_frame+1, :, :], F, axis=1)
+        results['keypoint_score'] = np.repeat(kps[:, freeze_frame:freeze_frame+1, :], F, axis=1)
+        return results
 
 @PIPELINES.register_module()
 class JointDisturbance:
@@ -649,9 +743,39 @@ class PositionRandomize:
     def __call__(self, results):
         kp = results['keypoint']
         H, W = results['img_shape']
+
+        kp = kp[0]  # (T, J, 2)
+        T, J, _ = kp.shape
+        offsets = kp - kp[0]  # (T, J, 2)
+        min_offset = offsets.min(axis=0)  # (J, 2)
+        max_offset = offsets.max(axis=0)  # (J, 2)
+        min_start = np.stack([-min_offset[:, 0], -min_offset[:, 1]], axis=-1)
+        max_start = np.stack([W - 1 - max_offset[:, 0],
+                              H - 1 - max_offset[:, 1]], axis=-1)
+        min_start = np.maximum(min_start, 0)
+        max_start = np.minimum(max_start, np.array([W - 1, H - 1]))
+        start_positions = np.random.uniform(min_start, max_start)
+        randomized_kp = start_positions + offsets
+        randomized_kp[..., 0] = np.clip(randomized_kp[..., 0], 0, W - 1)
+        randomized_kp[..., 1] = np.clip(randomized_kp[..., 1], 0, H - 1)
+
+        results['keypoint'] = randomized_kp[None]
+        return results
+
+@PIPELINES.register_module()
+class FramewisePositionRandomize:
+    def __call__(self, results):
+        kp = results['keypoint']
+        H, W = results['img_shape']
         random_kp = np.zeros_like(kp, dtype=kp.dtype)
         random_kp[..., 0] = np.random.uniform(0, W, size=kp[..., 0].shape)  # x
         random_kp[..., 1] = np.random.uniform(0, H, size=kp[..., 1].shape)  # y
 
         results['keypoint'] = random_kp
+        return results
+
+@PIPELINES.register_module()
+class MyNewPlaceHolder:
+    def __call__(self, results):
+        # Placeholder for future implementation
         return results

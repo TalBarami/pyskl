@@ -5,13 +5,15 @@ import mmcv
 import os
 import os.path as osp
 import time
+
+import numpy as np
 import torch
 import torch.distributed as dist
 from mmcv import Config
 from mmcv import digit_version as dv
 from mmcv import load
 from mmcv.cnn import fuse_conv_bn
-from mmcv.engine import single_gpu_test
+# from mmcv.engine import single_gpu_test
 from mmcv.fileio.io import file_handlers
 # from mmcv.parallel import MMDistributedDataParallel
 from mmcv.runner import load_checkpoint
@@ -20,6 +22,36 @@ from pyskl.datasets import build_dataloader, build_dataset
 from pyskl.models import build_model
 from pyskl.utils import cache_checkpoint
 
+def single_gpu_test(model, data_loader):
+    """Test model with a single gpu.
+
+    This method tests model with a single gpu and displays test progress bar.
+
+    Args:
+        model (nn.Module): Model to be tested.
+        data_loader (nn.Dataloader): Pytorch data loader.
+
+    Returns:
+        list: The prediction results.
+    """
+    model.eval()
+    results = []
+    dataset = data_loader.dataset
+    prog_bar = mmcv.ProgressBar(len(dataset))
+    for data in data_loader:
+        with torch.no_grad():
+            result = model(return_loss=False, **data)
+        if 'start' in data and 'end' in data:
+            start = data['start'].numpy()
+            end = data['end'].numpy()
+            results.append(np.hstack((result, [np.concatenate([start, end])])))
+        else:
+            results.extend(result)
+
+        batch_size = len(result)
+        for _ in range(batch_size):
+            prog_bar.update()
+    return results
 
 def parse_args():
     parser = argparse.ArgumentParser(

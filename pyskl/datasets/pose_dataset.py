@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import os
 import os.path as osp
 import random
 
@@ -124,11 +125,13 @@ class ASDetDataset(PoseDataset):
                  step_size_seconds,
                  valid_threshold,
                  njoints_threshold,
+                 balance=None,
+                 balanced_children=False,
+                 limit_rooms=None,
                  random_sampling_state=None,
                  min_length_prop=0.75,
                  fold=None,
                  split='train',
-                 balance=None,
                  valid_ratio=None,
                  box_thr=None,
                  class_prob=None,
@@ -139,6 +142,11 @@ class ASDetDataset(PoseDataset):
             self.files = pd.Series({'filepath': ann_file, 'split': 'test', 'fold': np.nan}).to_frame().T
         else:
             files = pd.read_csv(ann_file)
+            # get $SLURM_SCRATCH_DIR if exists:
+            ssd = os.environ.get('SLURM_SCRATCH_DIR')
+            if osp.exists(ssd):
+                print(f'{ssd} exists, redirecting to scratch')
+                files['filepath'] = files['basename'].apply(lambda b: osp.join(ssd, f'{b}.h5'))
             files = files[files['atype'].isin(atypes)].reset_index(drop=True)
             self.files = files
         self.target_fps = target_fps
@@ -153,6 +161,8 @@ class ASDetDataset(PoseDataset):
         self.fold = fold
         self.split = split
         self.balance = balance
+        self.balanced_children = balanced_children
+        self.limit_rooms = limit_rooms
         self.ds, self.metadata = self.load_dataset()
         super().__init__(ann_file, pipeline, split, valid_ratio, box_thr, class_prob, memcached, mc_cfg, **kwargs)
 
@@ -198,6 +208,14 @@ class ASDetDataset(PoseDataset):
         files = self.files[self.files['split'] == self.split]
         if self.fold is not None:
             files = files[files['fold'].isin(self.fold)]
+        if self.balanced_children:
+            children = files.drop_duplicates(subset='cid')
+            ctrl = children[children['final_diagnosis'] == 'Control']['cid']
+            asd = children[children['final_diagnosis'] == 'ASD'].sample(n=len(ctrl), random_state=self.random_sampling_state)['cid']
+            cids = np.concatenate([ctrl, asd])
+            files = files[files['cid'].isin(cids)]
+        if self.limit_rooms is not None and len(self.limit_rooms) > 0:
+            files = files[files['room'].isin(self.limit_rooms)]
         for i, row in files.iterrows():
             f = row['filepath']
             if not osp.exists(f):
@@ -225,24 +243,26 @@ class ASDetDataset(PoseDataset):
     def load_annotations(self):
         """Load annotation file to get video information."""
         df = self.ds
-        if self.balance in ['downsample', 'upsample']:
-            counts = df['final_diagnosis'].value_counts()
-            n = counts.min() if self.balance == 'downsample' else counts.max()
-            def safe_sample(group):
-                rep = n > len(group)  # only oversample minority with replacement
-                return group.sample(n=n, random_state=self.random_sampling_state, replace=rep)
-            df = (
-                df.groupby('final_diagnosis', group_keys=False)
-                .apply(safe_sample)
-                .reset_index(drop=True)
-            )
-        elif self.balance is not None:
-            raise ValueError(f'Unknown balance method: {self.balance}')
+        if self.balance is not None:
+            if self.balance in ['downsample', 'upsample']:
+                counts = df['final_diagnosis'].value_counts()
+                n = counts.min() if self.balance == 'downsample' else counts.max()
+                def safe_sample(group):
+                    rep = n > len(group)  # only oversample minority with replacement
+                    return group.sample(n=n, random_state=self.random_sampling_state, replace=rep)
+                df = (
+                    df.groupby('final_diagnosis', group_keys=False)
+                    .apply(safe_sample)
+                    .reset_index(drop=True)
+                )
+            else:
+                raise ValueError(f'Unknown balance method: {self.balance}')
         ds = [{
                 'start': row['start'],
                 'end': row['end'],
                 'basename': row['basename'],
                 'label': row['label'],
+                'fps': self.metadata[row['basename']]['fps'],
                 'valid%': row['valid%'],
                 'mean_valid_joints': row['mean_valid_joints'],
                 'above_t_valid_joints': row['above_t_valid_joints'],

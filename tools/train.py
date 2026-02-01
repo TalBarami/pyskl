@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from mmcv import Config
 from mmcv import digit_version as dv
-from mmcv.runner import get_dist_info, init_dist, set_random_seed
+from mmcv.runner import set_random_seed
 from mmcv.utils import get_git_hash
 
 from pyskl import __version__
@@ -72,12 +72,13 @@ def main():
         # use config filename as default work_dir if cfg.work_dir is None
         cfg.work_dir = osp.join('./work_dirs', osp.splitext(osp.basename(args.config))[0])
 
-    if not hasattr(cfg, 'dist_params'):
-        cfg.dist_params = dict(backend='nccl')
+    # if not hasattr(cfg, 'dist_params'):
+    #     cfg.dist_params = dict(backend='nccl')
 
-    init_dist(args.launcher, **cfg.dist_params)
-    rank, world_size = get_dist_info()
-    cfg.gpu_ids = range(world_size)
+    # init_dist(args.launcher, **cfg.dist_params)
+    # rank, world_size = get_dist_info()
+    # cfg.gpu_ids = range(world_size)
+    cfg.gpu_ids = 0
 
     auto_resume = cfg.get('auto_resume', True)
     if auto_resume and cfg.get('resume_from', None) is None:
@@ -135,29 +136,29 @@ def main():
 
     test_option = dict(test_last=args.test_last, test_best=args.test_best)
 
-    default_mc_cfg = ('localhost', 22077)
-    memcached = cfg.get('memcached', False)
+    # default_mc_cfg = ('localhost', 22077)
+    # memcached = cfg.get('memcached', False)
 
-    if rank == 0 and memcached:
-        # mc_list is a list of pickle files you want to cache in memory.
-        # Basically, each pickle file is a dictionary.
-        mc_cfg = cfg.get('mc_cfg', default_mc_cfg)
-        assert isinstance(mc_cfg, tuple) and mc_cfg[0] == 'localhost'
-        if not test_port(mc_cfg[0], mc_cfg[1]):
-            mc_on(port=mc_cfg[1], launcher=args.launcher)
-        retry = 3
-        while not test_port(mc_cfg[0], mc_cfg[1]) and retry > 0:
-            time.sleep(5)
-            retry -= 1
-        assert retry >= 0, 'Failed to launch memcached. '
+    # if rank == 0 and memcached:
+    #     # mc_list is a list of pickle files you want to cache in memory.
+    #     # Basically, each pickle file is a dictionary.
+    #     mc_cfg = cfg.get('mc_cfg', default_mc_cfg)
+    #     assert isinstance(mc_cfg, tuple) and mc_cfg[0] == 'localhost'
+    #     if not test_port(mc_cfg[0], mc_cfg[1]):
+    #         mc_on(port=mc_cfg[1], launcher=args.launcher)
+    #     retry = 3
+    #     while not test_port(mc_cfg[0], mc_cfg[1]) and retry > 0:
+    #         time.sleep(5)
+    #         retry -= 1
+    #     assert retry >= 0, 'Failed to launch memcached. '
 
-    dist.barrier()
+    # dist.barrier()
 
     train_model(model, datasets, cfg, validate=args.validate, test=test_option, timestamp=timestamp, meta=meta)
-    dist.barrier()
+    # dist.barrier()
 
-    if rank == 0 and memcached:
-        mc_off()
+    # if rank == 0 and memcached:
+    #     mc_off()
 
 
 if __name__ == '__main__':
